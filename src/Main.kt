@@ -1,142 +1,420 @@
 import java.util.*
 import java.util.stream.Collectors
+import kotlin.collections.HashMap
+import kotlin.collections.HashSet
 import kotlin.math.floor
 import kotlin.math.min
 
-private operator fun <E> List<E>.component6(): E = this[5]
-private operator fun <E> List<E>.component7(): E = this[6]
-private operator fun <E> List<E>.component8(): E = this[7]
+const val DEBUGGING = false
+
+const val MAX_GAME_TURNS = 100
+
+const val DIRECTIONS = 6
 
 private fun debug(vararg element: Any) {
   System.err.println(element.joinToString(" | "))
 }
 
 fun main() {
-  val numberOfCells = readln().toInt()
+  val input = Scanner(System.`in`)
 
-  val board = Board(numberOfCells)
-  val game = Game(board, numberOfCells)
+  val game = Game(input)
 
-  val numberOfBases = readln().toInt()
-
-  board.initBases(numberOfBases)
-
-  val ownBases = readln().split(" ").map {it.toInt()}
-  val oppBases = readln().split(" ").map {it.toInt()}
-
-  repeat(numberOfBases) {
-    board.addBase(it, ownBases[it])
-    board.addOppBase(it, oppBases[it])
-  }
-
-  while (true) {
-    board.newTurn(false)
+  repeat (MAX_GAME_TURNS) {
     game.newTurn()
-    game.update()
-    board.newTurn(true)
-    game.compute()
-    game.doActions()
+    val antsNetwork = game.compute()
+    game.defineMovement(antsNetwork)
   }
 }
 
-class Cell(private val type: Int, var resources: Int, var ants: Int, var oppAnts: Int, var position: Int) {
-  val neighbors = arrayListOf<Int>()
-  fun hasEgg() = this.type == 1 && !isEmpty()
-  fun hasCrystal() = this.type == 2 && !isEmpty()
+data class Cell(
+  var id: Int,
+  private val type: Int,
+  var resources: Int = 0,
+  var ownAnts: Int = 0,
+  var opponentAnts: Int = 0,
+  val neighbors: List<Int> = emptyList()
+) {
+  fun containsEggs() = this.type == 1 && !isEmpty()
+  fun containsCrystal() = this.type == 2 && !isEmpty()
   fun isEmpty() = this.resources == 0
 
-  fun addNeighbor(index: Int) {
-    if (index == -1) return
-    neighbors.add(index)
-  }
-
-  fun getScore(board: Board, usedCells: Set<Int>): Int {
-    val base = board.getBases()
-      .filter { board.getDistance(it, position) != -1 }
-      .minBy { board.getDistance(it, position) }
-
-    val strength = floor(board.countAnts().toDouble() / board.getDistance(base, position) + 1)
-    return min(resources.toDouble(), strength).toInt()
+  companion object {
+    fun from(id: Int, input: Scanner): Cell {
+      return Cell(
+        id,
+        type = input.nextInt(),
+        resources = input.nextInt(),
+        neighbors = IntArray(DIRECTIONS) { input.nextInt() }.filter { it != -1 }
+      )
+    }
   }
 }
 
-class Bfs(numberOfCells: Int) {
-  private val pathsCache = Array(numberOfCells) {
-    Array<Pair<List<Int>?, Boolean>>(numberOfCells) {
-      null to false
-    }
+class ExplorationCache(numberOfCells: Int) {
+  private val distanceCache = Array(numberOfCells) { IntArray(numberOfCells) { -1 } }
+  private val pathsCache = Array(numberOfCells) { Array(numberOfCells) { emptyList<Int>() } }
+
+  fun getDistance(from: Int, to: Int): Int? {
+    if (distanceCache[from][to] == -1) return null
+    return distanceCache[from][to]
   }
 
-  fun findShortestPath(from: Cell, to: Cell, board: Board, ants: Boolean = false): List<Int>? {
-    val exists = pathsCache[from.position][to.position]
+  fun registerDistance(from: Int, to: Int, distance: Int) {
+    distanceCache[from][to] = distance
+    distanceCache[to][from] = distance
+  }
 
-    if (exists.second) return exists.first
+  fun getPath(from: Int, to: Int): List<Int>? {
+    if (pathsCache[from][to].isEmpty()) return null
+    return pathsCache[from][to]
+  }
 
-    val queue = LinkedList<Cell>()
-    val prev = mutableMapOf<Int, Int?>()
+  fun registerPath(from: Int, to: Int, path: List<Int>) {
+    pathsCache[from][to] = path
+    pathsCache[to][from] = path.reversed()
+  }
+}
 
-    prev[from.position] = null
-    queue.add(from)
+class Game(private val input: Scanner) {
+  private val numberOfCells = input.nextInt()
+  private val explorationCache = ExplorationCache(numberOfCells)
 
-    while (queue.isNotEmpty()) {
-      if (prev.containsKey(to.position)) break
+  private val cells = (0 until numberOfCells).associateWith { Cell.from(it, input) }
 
-      val head = queue.pop()
+  private val numberOfBases = input.nextInt()
+  private val friendlyBases = Array(numberOfBases) { getCell(input.nextInt()) }
+  private val opponentBases = Array(numberOfBases) { getCell(input.nextInt()) }
 
-      val neighbors = if (ants) head.neighbors.filter { board.getCell(it).ants > 0 } else head.neighbors.sorted()
+  private val initialCrystal = cells.values.sumOf { cell -> if (cell.containsCrystal()) cell.resources else 0 }
+  private val initialEggs = cells.values.sumOf { cell -> if (cell.containsEggs()) cell.resources else 0 }
 
-      for (neigh in neighbors) {
-        val neighVisited = prev.containsKey(neigh)
-        if (!neighVisited) {
-          prev[neigh] = head.position
-          queue.add(board.getCell(neigh))
+  private var currentCrystal = 0
+  private var currentEggs = 0
+
+  private var ownScore = 0
+  private var opponentScore = 0
+
+  private val actions = arrayListOf<String>()
+  private val messages = arrayListOf<String>()
+
+  private val targets = mutableMapOf<Int, Int>()
+
+  private val fixedTargets = mutableSetOf<Cell>()
+
+  fun newTurn() {
+    updateProperties()
+    readScores()
+    readCells()
+  }
+
+  private fun updateProperties() {
+    currentEggs = 0
+    currentCrystal = 0
+    targets.clear()
+    actions.clear()
+    messages.clear()
+  }
+
+  fun compute(): Set<Int> {
+    debug(initialEggs, initialCrystal, currentEggs, currentCrystal)
+    val usedCells = validateFixedTargets()
+    val targets = getTargets()
+
+    if (DEBUGGING) debug("Targets: ${targets.map { it.id }}")
+
+    val (prioritizeEggs, prioritizeCrystal, none) = getPrioritization()
+
+    if (DEBUGGING) debug("Current prioritization (E|C|N): ($prioritizeEggs|$prioritizeCrystal|$none)")
+
+    val crystalsNextTo = targets.count { cell ->
+      val base = getBase(cell)
+
+      cell.containsCrystal() && getDistance(base, cell) == 1
+    }
+
+    if (DEBUGGING) debug("Crystals next to: $crystalsNextTo")
+
+    var approvedTargets = 0
+
+    for (cell in targets) {
+      if (DEBUGGING) debug("Doing for ${cell.id}")
+      if (prioritizeEggs && !cell.containsEggs()) continue
+      if (prioritizeCrystal && !cell.containsCrystal()) continue
+      if (getScore(cell) == 0) continue
+
+      if (DEBUGGING) debug("First filter for ${cell.id}")
+
+      val base = getBase(cell)
+
+      if ((approvedTargets - crystalsNextTo) > 0 && getDistance(base, cell) == 1 && cell.containsCrystal()) continue
+
+      if (DEBUGGING) debug("Second filter for ${cell.id}")
+
+      if (getDistance(base, cell) != 1) {
+        if (fixedTargets.isNotEmpty()) {
+          val elements = fixedTargets.stream().filter { f ->
+            val baseForElem = getBase(f)
+
+            baseForElem == base
+          }.collect(Collectors.toList())
+
+          if (elements.isNotEmpty()) {
+            if (elements.any { f ->
+              val baseForElem = getBase(f)
+              getDistance(baseForElem, f) == 1 && f.containsEggs()
+            }) continue
+          }
         }
       }
+
+      if (DEBUGGING) debug("Third filter for ${cell.id}")
+
+      val resultingCells = mutableSetOf<Int>()
+      resultingCells.addAll(usedCells)
+
+      val pathTo = getBestPath(base, cell, usedCells)
+
+      resultingCells.addAll(pathTo)
+
+      val antsPerCell = floor(getAnts().toDouble() / resultingCells.size)
+
+      val isSufficient = pathTo.all { getOpponentAttackPower(getCell(it)) <= antsPerCell }
+
+      if (!isSufficient) continue
+
+      if (DEBUGGING) debug("Fourth filter for ${cell.id}")
+
+      val sameBase = if (friendlyBases.size == 1 || fixedTargets.isEmpty()) true
+      else {
+        val firstBase = friendlyBases
+          .minBy { getDistance(it, fixedTargets.first()) }
+
+        fixedTargets.all { friendlyBases.minBy { b -> getDistance(b, it) } == firstBase }
+      }
+
+      if (DEBUGGING) debug("Same base for ${cell.id}: $sameBase")
+
+      val minAnts = if (fixedTargets.isEmpty()) 1
+      else if (friendlyBases.size == 1) 3
+      else if (sameBase)  {
+        val firstBase = friendlyBases.minBy { getDistance(it, fixedTargets.first()) }
+
+        if (base == firstBase) 3 else 1
+      }
+      else 3
+
+      if (DEBUGGING) debug("Required ants for ${cell.id}: $minAnts. Ants per cell: $antsPerCell")
+
+      if (antsPerCell < minAnts) continue
+
+      if (DEBUGGING) debug("Fifth filter for ${cell.id}")
+
+      approvedTargets += 1
+      fixedTargets.add(cell)
+      usedCells.addAll(pathTo)
+    }
+    return usedCells
+  }
+  private fun getPrioritization(): BooleanArray {
+    val eggs = currentEggs.toDouble() / initialEggs
+    val crystal = currentCrystal.toDouble() / initialCrystal
+
+    val goForEggs = eggs > 0.7
+    val goForCrystal = crystal < 0.7 || cells.values.count { it.containsCrystal() } == 1
+
+    val prioritizeEggs = goForEggs && !goForCrystal
+    val prioritizeCrystal = goForCrystal && !goForEggs
+    val noPrioritization = (goForCrystal && goForEggs) || (!goForCrystal && !goForEggs)
+
+    return booleanArrayOf(prioritizeEggs, prioritizeCrystal, noPrioritization)
+  }
+
+  private fun getTargets(): List<Cell> {
+    val (prioritizeEggs, prioritizeCrystal, prioritizeAny) = getPrioritization()
+
+    return cells.values
+      .filter { (prioritizeEggs && it.containsEggs()) || (prioritizeCrystal && it.containsCrystal()) || prioritizeAny }
+      .filter {
+        val oppBase = getOpponentBase(it)
+
+        !(getDistance(oppBase, it) == 1 && it.containsCrystal()) && it.resources > 0
+      }
+      .sortedWith { cell1, cell2 -> compareCells(cell1, cell2) }
+  }
+
+  private fun getCell(id: Int): Cell {
+    return cells[id] ?: throw Exception("Not found cell with id {$id}")
+  }
+
+  private fun getBase(cell: Cell) = friendlyBases.minBy { getDistance(it, cell) }
+  private fun getOpponentBase(cell: Cell) = opponentBases.minBy { getDistance(it, cell) }
+
+  private fun getScore(cell: Cell): Int {
+    val base = getBase(cell)
+
+    val strength = floor(getAnts().toDouble() / getDistance(base, cell)).toInt()
+    return minOf(cell.resources, strength)
+  }
+
+  private fun getAnts() = cells.values.sumOf { it.ownAnts }
+
+  private fun getDistance(from: Cell, to: Cell): Int {
+    if (from == to) return 0
+
+    var distance = explorationCache.getDistance(from.id, to.id)
+
+    if (distance != null) return distance
+
+    distance = calculateDistance(from, to)
+
+    explorationCache.registerDistance(from.id, to.id, distance)
+
+    return distance
+  }
+
+  private fun calculateDistance(from: Cell, to: Cell): Int {
+    val visited = HashSet<Int>(numberOfCells)
+    val queue: Queue<Pair<Cell, Int>> = LinkedList()
+
+    queue.add(from to 0)
+    visited.add(from.id)
+
+    while (queue.isNotEmpty()) {
+      val (head, distance) = queue.poll()
+
+      if (head.id == to.id) return distance
+
+      head.neighbors
+        .filter { it !in visited }
+        .forEach {
+          visited.add(it)
+          queue.add(getCell(it) to distance + 1)
+        }
     }
 
-    if (!prev.containsKey(to.position)) {
-      pathsCache[from.position][to.position] = null to true
-      return null
+    return -1
+  }
+
+  private fun getDistanceToAnts(from: Cell): Int {
+    val visited = HashSet<Int>(numberOfCells)
+    val queue: Queue<Pair<Cell, Int>> = LinkedList()
+
+    queue.add(from to 0)
+    visited.add(from.id)
+
+    while (queue.isNotEmpty()) {
+      val (head, distance) = queue.poll()
+
+      if (head.ownAnts > 0) return distance
+
+      head.neighbors
+        .filter { it !in visited }
+        .forEach {
+          visited.add(it)
+          queue.add(getCell(it) to distance + 1)
+        }
     }
 
-    val path = LinkedList<Int>()
-    var current: Int? = to.position
+    return -1
+  }
 
-    while (current != null) {
-      path.addFirst(current)
-      current = prev[current]
+  private fun getBestPath(from: Cell, target: Cell, usedCells: Set<Int>): List<Int> {
+    if (usedCells.isEmpty()) return getPath(from, target)
+    val visited = HashSet<Int>(numberOfCells)
+    val queue: Queue<Pair<Cell, List<Int>>> = LinkedList()
+
+    queue.add(target to listOf(target.id))
+
+    while (queue.isNotEmpty()) {
+      val (head, path) = queue.poll()
+
+      if (head.id in usedCells) return path
+
+      head.neighbors
+        .filter { it !in visited }
+        .forEach {
+          val cell = getCell(it)
+          visited.add(cell.id)
+          queue.add(cell to path + cell.id)
+        }
     }
 
-    pathsCache[from.position][to.position] = path to true
+    return emptyList()
+  }
+
+  private fun getPath(from: Cell, to: Cell): List<Int> {
+    var path = explorationCache.getPath(from.id, to.id)
+
+    if (path != null) return path
+
+    path = findPath(from, to)
+
+    explorationCache.registerPath(from.id, to.id, path)
 
     return path
   }
 
-  fun findAttackPath(base: Int, target: Int, board: Board): LinkedList<Int>? {
-    val maxPathValues = IntArray(board.numberOfCells) {Int.MIN_VALUE}
-    val prev = IntArray(board.numberOfCells) {-1}
-    val distanceFromStart = IntArray(board.numberOfCells)
-    val visited = BooleanArray(board.numberOfCells) {false}
+  private fun findPath(from: Cell, to: Cell): List<Int> {
+    val visited = HashSet<Int>(numberOfCells)
+    val queue: Queue<Pair<Cell, List<Int>>> = LinkedList()
 
-    val valueComparator = Comparator.comparing { cellIndex: Int -> maxPathValues[cellIndex] }
-    val distanceComparator = Comparator.comparing { cellIndex: Int -> distanceFromStart[cellIndex] + board.getDistance(cellIndex, target) }
+    queue.add(from to listOf(from.id))
 
-    val queue: PriorityQueue<Int> = PriorityQueue(valueComparator.reversed().thenComparing(distanceComparator))
+    while (queue.isNotEmpty()) {
+      val (head, path) = queue.poll()
 
-    maxPathValues[base] = board.getCell(base).oppAnts
-    distanceFromStart[base] = 0
+      if (head.id == to.id) return path
 
-    val startAnts = board.getCell(base).oppAnts
+      head.neighbors
+        .filter { it !in visited }
+        .forEach {
+          val cell = getCell(it)
+          visited.add(cell.id)
+          queue.add(cell to path + cell.id)
+        }
+    }
 
-    if (startAnts > 0) queue.add(base)
+    return emptyList()
+  }
 
-    while (queue.isNotEmpty() && !visited[target]) {
+  private fun getOpponentAttackPower(target: Cell): Int {
+    val allPaths = arrayListOf<List<Int>>()
+
+    allPaths.addAll(opponentBases.map { getAttackPath(it, target) }.filter { it.isNotEmpty() })
+
+    return allPaths.maxOfOrNull { it.minOfOrNull { cellId -> getCell(cellId).opponentAnts } ?: 0 } ?: 0
+  }
+
+  private fun getAttackPath(base: Cell, target: Cell): List<Int> {
+    return getOpponentAttackPath(base, target)
+  }
+
+  private fun getOpponentAttackPath(base: Cell, target: Cell): List<Int> {
+    val maxPathValues = IntArray(numberOfCells) { Int.MIN_VALUE }
+    val prev = IntArray(numberOfCells) { -1 }
+    val distanceFromStart = IntArray(numberOfCells)
+    val visited = BooleanArray(numberOfCells)
+
+    val valueComparator = compareByDescending<Int> { maxPathValues[it] }
+    val distanceComparator = compareBy<Int> { distanceFromStart[it] + getDistance(getCell(it), target) }
+
+    val queue: PriorityQueue<Int> = PriorityQueue(valueComparator.thenComparing(distanceComparator))
+
+    maxPathValues[base.id] = base.opponentAnts
+    distanceFromStart[base.id] = 0
+
+    val startAnts = base.opponentAnts
+
+    if (startAnts > 0) queue.add(base.id)
+
+    while (queue.isNotEmpty() && !visited[target.id]) {
       val current = queue.poll()
       visited[current] = true
 
-      for (neigh in board.getCell(current).neighbors) {
-        val neighCell = board.getCell(neigh)
-        val neighAnts = neighCell.oppAnts
+      for (neigh in getCell(current).neighbors) {
+        val neighCell = getCell(neigh)
+        val neighAnts = neighCell.opponentAnts
 
         if (!visited[neigh] && neighAnts > 0) {
           val potentialMaxPathValue = min(maxPathValues[current], neighAnts)
@@ -150,12 +428,12 @@ class Bfs(numberOfCells: Int) {
       }
     }
 
-    if (!visited[target]) {
-      return null
+    if (!visited[target.id]) {
+      return emptyList()
     }
 
     val path = LinkedList<Int>()
-    var currentIndex = target
+    var currentIndex = target.id
 
     while (currentIndex != -1) {
       path.addFirst(currentIndex)
@@ -164,451 +442,55 @@ class Bfs(numberOfCells: Int) {
 
     return path
   }
-}
 
-data class BoardCache(
-  var crystalCells: List<Cell> = emptyList(),
-  var eggCells: List<Cell> = emptyList(),
-)
+  private fun compareCells(cell1: Cell, cell2: Cell): Int {
+    val (prioritizeEggs, prioritizeCrystal, _) = getPrioritization()
 
-class Board(val numberOfCells: Int) {
-  private val distanceCache = Array(numberOfCells) { IntArray(numberOfCells) }
-  private val bfs = Bfs(numberOfCells)
+    if (cell1.isEmpty() && !cell2.isEmpty()) return 1
+    if (!cell1.isEmpty() && cell2.isEmpty()) return -1
+    if (cell1.isEmpty() && cell2.isEmpty()) return 0
 
-  private var upToDateCells = false
-  private var updatingCells = true
-  private var firstUpdate = true
+    val scoreCell1 = getScore(cell1)
+    val scoreCell2 = getScore(cell2)
 
-  var initialEggs = 0
-  var initialCrystal = 0
-
-  private val cache = BoardCache()
-
-  private lateinit var bases: IntArray
-  private lateinit var oppBases: IntArray
-
-  private var initialCellsWithResources = 0
-  private var cellsWithResourcesIndices: IntArray
-  private var cells: Array<Cell>
-
-  init {
-    val cellsIndices = arrayListOf<Int>()
-    cells = Array(numberOfCells) {
-      val (type, initialResources, neigh0, neigh1, neigh2, neigh3, neigh4, neigh5) = readln().split(" ")
-        .map { p -> p.toInt() }
-      val cell = Cell(type, initialResources, 0, 0, it)
-      cell.addNeighbor(neigh0)
-      cell.addNeighbor(neigh1)
-      cell.addNeighbor(neigh2)
-      cell.addNeighbor(neigh3)
-      cell.addNeighbor(neigh4)
-      cell.addNeighbor(neigh5)
-
-      if (type != 0) {
-        initialCellsWithResources += 1
-        cellsIndices.add(it)
-      }
-
-      cell
-    }
-
-    cellsWithResourcesIndices = cellsIndices.toIntArray()
-  }
-
-  fun initBases(amount: Int) {
-    this.bases = IntArray(amount) {-1}
-    this.oppBases = IntArray(amount) {-1}
-  }
-
-  fun addBase(base: Int, cell: Int) {
-    this.bases[base] = cell
-  }
-
-
-  fun addOppBase(base: Int, cell: Int) {
-    this.oppBases[base] = cell
-  }
-
-  fun updateCell(index: Int, resources: Int, ants: Int, oppAnts: Int) {
-    cells[index].resources = resources
-    cells[index].ants = ants
-    cells[index].oppAnts = oppAnts
-  }
-
-  fun getBases() = this.bases
-  fun getOppBases() = this.oppBases
-
-  fun getCrystalCells(): List<Cell> {
-    if (upToDateCells) return cache.crystalCells
-
-    val crystalCells = cells.filter { it.hasCrystal() }.map { it }
-
-    cache.crystalCells = crystalCells
-    return crystalCells
-  }
-
-  fun getEggsCells(): List<Cell> {
-    if (upToDateCells) return cache.eggCells
-
-    val eggCells = cells.filter { it.hasEgg() }.map { it }
-
-    cache.eggCells = eggCells
-    return eggCells
-  }
-
-  fun getCell(index: Int) = cells[index]
-
-  fun newTurn(upToDateCells: Boolean) {
-    this.upToDateCells = upToDateCells
-    this.updatingCells = !upToDateCells
-    if (firstUpdate) {
-      firstUpdate = false
-      val (eggs, crystal) = getResourcesInfo()
-      initialEggs = eggs.toInt()
-      initialCrystal = crystal.toInt()
-    }
-  }
-
-  private fun upToDate() = this.upToDateCells && !this.updatingCells
-
-  fun resourcesIndices() = this.cellsWithResourcesIndices
-
-  fun getPrioritization(): BooleanArray {
-    val (currentEggs, currentCrystal) = getResourcesInfo()
-    val eggs = currentEggs / initialEggs
-    val crystal = currentCrystal / initialCrystal
-
-    val goForEggs = eggs > 0.7
-    val goForCrystal = crystal < 0.7 || getCrystalCells().size == 1
-
-    val prioritizeEggs = goForEggs && !goForCrystal
-    val prioritizeCrystal = goForCrystal && !goForEggs
-    val noPrioritization = (goForCrystal && goForEggs) || (!goForCrystal && !goForEggs)
-
-    return booleanArrayOf(prioritizeEggs, prioritizeCrystal, noPrioritization)
-  }
-
-  private fun getResourcesInfo(): Pair<Double, Double> {
-    var totalEggs = 0.0
-    var totalCrystal = 0.0
-
-    resourcesIndices().forEach {
-      val cell = cells[it]
-      if (cell.hasEgg()) {
-        totalEggs += cell.resources
-      } else if (cell.hasCrystal()) {
-        totalCrystal += cell.resources
-      }
-    }
-
-    return totalEggs to totalCrystal
-  }
-
-  fun getAttackPower(target: Int): Int {
-    return 0
-  }
-
-  fun getOpponentAttackPower(target: Int): Int {
-    val bases = getOppBases()
-
-    val allPaths = arrayListOf<LinkedList<Int>>()
-
-    for (base in bases) {
-      val bestPath = getAttackPath(base, target)
-
-      if (bestPath != null) {
-        allPaths.add(bestPath)
-      }
-    }
-
-    return allPaths.stream()
-      .mapToInt {
-        it.stream()
-          .mapToInt { c -> getCell(c).oppAnts }
-          .min()
-          .orElse(0)
-      }
-      .max()
-      .orElse(0)
-  }
-
-  private fun getAttackPath(base: Int, target: Int): LinkedList<Int>? {
-    return bfs.findAttackPath(base, target, this)
-  }
-
-  fun getBestPath(from: Cell, to: Cell, usingCells: Set<Int>): List<Int>? {
-    if (usingCells.isEmpty()) return bfs.findShortestPath(from, to, this)
-
-    val minConnectedByDistance = usingCells
-      .filter { getDistance(it, to.position) != -1 }
-      .minBy { getDistance(it, to.position) }
-
-    val originalDistance = getDistance(from.position, to.position)
-    val minConnectedDistance = getDistance(minConnectedByDistance, to.position)
-
-    return if (originalDistance > minConnectedDistance) {
-      bfs.findShortestPath(getCell(minConnectedByDistance), to, this)
-    } else bfs.findShortestPath(from, to, this)
-  }
-
-  fun getDistance(from: Int, to: Int): Int {
-    if (from == to) return 0
-
-    val cached = distanceCache[from][to]
-    if (cached > 0) return cached
-
-    val distance = calcDist(from, to)
-
-    distanceCache[from][to] = distance
-    distanceCache[to][from] = distance
-
-    return distance
-  }
-
-  private fun calcDist(from: Int, to: Int): Int {
-    val path = bfs.findShortestPath(getCell(from), getCell(to), this) ?: return -1
-
-    return path.size - 1
-  }
-
-  fun countAnts(): Int {
-    return cells.sumOf { it.ants }
-  }
-}
-
-class CellComparator(private val board: Board, private val usedCells: Set<Int>) : Comparator<Int> {
-  override fun compare(cell1: Int, cell2: Int): Int {
-    val (prioritizeEggs, prioritizeCrystal, noPrioritization) = board.getPrioritization()
-
-    val o1 = board.getCell(cell1)
-    val o2 = board.getCell(cell2)
-
-    if (o1.isEmpty() && !o2.isEmpty()) return 1
-    if (!o1.isEmpty() && o2.isEmpty()) return -1
-    if (o1.isEmpty() && o2.isEmpty()) return 0
-
-    val sC = o2.getScore(board, usedCells).compareTo(o1.getScore(board, usedCells))
-
-    if (prioritizeEggs) {
-      return o2.getScore(board, usedCells).compareTo(o1.getScore(board, usedCells))
+    return if (prioritizeEggs) {
+      scoreCell2.compareTo(scoreCell1)
     } else if (prioritizeCrystal) {
-      return o1.getScore(board, usedCells).compareTo(o2.getScore(board, usedCells))
-//      return if (sC == 0) {
-//        val baseA = board.getBases()
-//          .filter { board.getDistance(it, cell1) != -1 }
-//          .minBy { board.getDistance(it, cell1)}
-//
-//        val baseB = board.getBases()
-//          .filter { board.getDistance(it, cell2) != -1 }
-//          .minBy { board.getDistance(it, cell2)}
-//
-//        board.getDistance(baseB, cell2).compareTo(board.getDistance(baseA, cell1))
-//      } else sC
+      scoreCell1.compareTo(scoreCell2)
     } else {
-      return if (o1.hasEgg() && o2.hasCrystal()) -1
-      else if (o1.hasCrystal() && o2.hasEgg()) 1
-      else if (o1.hasEgg() && o2.hasEgg()) o2.getScore(board, usedCells).compareTo(o1.getScore(board, usedCells))
-      else o1.getScore(board, usedCells).compareTo(o2.getScore(board, usedCells))
+      if (cell1.containsEggs() && cell2.containsCrystal()) -1
+      else if (cell1.containsCrystal() && cell2.containsEggs()) 1
+      else if (cell1.containsEggs() && cell2.containsEggs()) scoreCell2.compareTo(scoreCell1)
+      else scoreCell1.compareTo(scoreCell2)
     }
-  }
-}
-
-class Game(private val board: Board, private val numberOfCells: Int) {
-  private val actions = arrayListOf<String>()
-  private val messages = arrayListOf<String>()
-  private val targets = mutableMapOf<Int, Int>()
-
-  private val fixedTargets = mutableSetOf<Int>()
-
-  fun update() {
-    val (_, _) = readln().split(" ").map { it.toInt() }
-    repeat(numberOfCells) {
-      val (resources, ants, oppAnts) = readln().split(" ").map{ v -> v.toInt() }
-      board.updateCell(it, resources, ants, oppAnts)
-    }
-  }
-
-  fun newTurn() {
-    targets.clear()
-    actions.clear()
-    messages.clear()
-  }
-
-  private fun sortedCells(usedCells: Set<Int>): List<Int> {
-    val (prioritizeEggs, prioritizeCrystal, _) = board.getPrioritization()
-
-    return board.resourcesIndices()
-      .filter { if (prioritizeEggs) board.getCell(it).hasEgg() else if (prioritizeCrystal) board.getCell(it).hasCrystal() else true}
-      .filter { !board.getCell(it).isEmpty() }
-      .filter {
-        val oppBase = board.getOppBases()
-          .filter { b -> board.getDistance(b, it) != -1}
-          .minBy { b -> board.getDistance(b, it) }
-
-        !(board.getDistance(oppBase, it) == 1 && board.getCell(it).hasCrystal()) && board.getCell(it).resources > 0
-      }
-      .sortedWith(CellComparator(board, usedCells))
   }
 
   private fun validateFixedTargets(): MutableSet<Int> {
-    fixedTargets.removeIf { board.getCell(it).resources == 0 }
-    val newTargets = mutableSetOf<Int>()
+    fixedTargets.removeIf { it.resources == 0 }
+    val newTargets = mutableSetOf<Cell>()
 
     val currentCells = mutableSetOf<Int>()
 
-    for (target in fixedTargets.sortedBy { board.getCell(it).oppAnts }) {
-      val cell = board.getCell(target)
+    for (cell in fixedTargets.sortedBy { it.opponentAnts }) {
+      val base = getBase(cell)
 
-      val base = board.getBases()
-        .filter { board.getDistance(it, cell.position) != -1 }
-        .minBy { board.getDistance(it, cell.position) }
-
-      val pathTo = board.getBestPath(board.getCell(base), board.getCell(cell.position), currentCells)!!
+      val pathTo = getBestPath(base, cell, currentCells)
       val combined = mutableSetOf<Int>()
       combined.addAll(currentCells)
       combined.addAll(pathTo)
 
-      val isSufficient = pathTo.all { board.getOpponentAttackPower(it) < floor(board.countAnts().toDouble() / combined.size.toDouble())}
+      val isSufficient = pathTo.all { getOpponentAttackPower(getCell(it)) <= floor(getAnts().toDouble() / combined.size.toDouble())}
 
       if (isSufficient) {
         currentCells.addAll(pathTo)
-        newTargets.add(target)
+        newTargets.add(cell)
       }
     }
 
     fixedTargets.clear()
     fixedTargets.addAll(newTargets)
 
-    for (target in currentCells) {
-      addBeacon(target, 1)
-    }
-
     return currentCells
-  }
-
-  fun compute() {
-    val usedCells = validateFixedTargets()
-    val targets = sortedCells(usedCells).toMutableList()
-
-    debug("Sorted targets: $targets")
-
-    val (prioritizeEggs, prioritizeCrystal, _) = board.getPrioritization()
-
-    when {
-      prioritizeEggs -> debug("E")
-      prioritizeCrystal -> debug("C")
-      else -> debug("B")
-    }
-
-    val crystalsNextTo = targets.count {
-      val c = board.getCell(it)
-
-      val base = board.getBases()
-        .filter { b -> board.getDistance(b, c.position) != -1 }
-        .minBy { b -> board.getDistance(b, c.position) }
-
-      c.hasCrystal() && board.getDistance(base, it) == 1
-    }
-
-    debug("Crystals next to: $crystalsNextTo")
-
-    var approvedTargets = 0
-
-    for (target in targets) {
-      debug("Doing for $target")
-
-      val cell = board.getCell(target)
-      if (prioritizeEggs && !cell.hasEgg()) continue
-      if (prioritizeCrystal && !cell.hasCrystal()) continue
-      if (cell.getScore(board, usedCells) == 0) continue
-
-      debug("First filter for $target")
-
-      val base = board.getBases()
-        .filter { board.getDistance(it, cell.position) != -1 }
-        .minBy { board.getDistance(it, cell.position) }
-
-      if (
-        (approvedTargets - crystalsNextTo) > 0 &&
-        board.getDistance(base, cell.position) == 1 &&
-        cell.hasCrystal()
-      ) continue
-
-      debug("Second filter for $target")
-
-      if (board.getDistance(base, cell.position) != 1) {
-        if (fixedTargets.isNotEmpty()) {
-          val elements = fixedTargets.stream().filter {f ->
-            val baseForElem = board.getBases()
-              .filter { board.getDistance(it, f) != -1 }
-              .minBy { board.getDistance(it, f) }
-
-            baseForElem == base
-          }.collect(Collectors.toList())
-
-          if (elements.isNotEmpty()) {
-            if (elements.any { f ->
-                val baseForElem = board.getBases()
-                  .filter { board.getDistance(it, f) != -1 }
-                  .minBy { board.getDistance(it, f) }
-
-                board.getDistance(baseForElem, f) == 1
-                    && board.getCell(f).hasEgg()
-              }) continue
-          }
-        }
-      }
-
-      debug("Third filter for $target")
-
-      val resultingCells = mutableSetOf<Int>()
-      resultingCells.addAll(usedCells)
-
-      val pathTo = board.getBestPath(board.getCell(base), board.getCell(cell.position), usedCells)!!
-
-      resultingCells.addAll(pathTo)
-
-      val antsPerCell = floor(board.countAnts().toDouble() / resultingCells.size)
-
-      val isSufficient = pathTo.all { board.getOpponentAttackPower(it) <= antsPerCell }
-
-      if (!isSufficient) continue
-
-      debug("Fourth filter for $target")
-
-      val sameBase = if (board.getBases().size == 1 || fixedTargets.isEmpty()) true
-      else {
-        val firstBase = board.getBases()
-          .minBy { board.getDistance(it, fixedTargets.first()) }
-
-        fixedTargets.all { board.getBases()
-          .minBy { b -> board.getDistance(b, it) } == firstBase }
-      }
-
-      debug("Same base for $target: $sameBase")
-
-      val minAnts = if (fixedTargets.isEmpty()) 1
-      else if (board.getBases().size == 1) 3
-      else if (sameBase)  {
-        val firstBase = board.getBases()
-          .minBy { board.getDistance(it, fixedTargets.first()) }
-
-        if (base == firstBase) 3
-        else 1
-      }
-      else 3
-
-      debug("Required ants for $target: $minAnts. Ants per cell: $antsPerCell")
-
-      if (antsPerCell < minAnts) continue
-
-      debug("Fifth filter for $target")
-
-      approvedTargets += 1
-      fixedTargets.add(cell.position)
-      usedCells.addAll(pathTo)
-      createLine(pathTo)
-    }
   }
 
   private fun addBeacon(index: Int, strength: Int) {
@@ -620,7 +502,7 @@ class Game(private val board: Board, private val numberOfCells: Int) {
     debug("Doing path: $path")
     val prioritizeEnd = path
     path.forEachIndexed { index, it ->
-      addBeacon(it, if (index == path.size - 1 && board.getCell(it).ants == 0) strength * 2 else strength)
+      addBeacon(it, if (index == path.size - 1 && getCell(it).ownAnts == 0) strength * 2 else strength)
     }
   }
 
@@ -632,11 +514,29 @@ class Game(private val board: Board, private val numberOfCells: Int) {
     messages.add(items.joinToString(" - "))
   }
 
-  fun doActions() {
-    targets.forEach { (k, v) -> actions.add("BEACON $k $v") }
+  fun defineMovement(targets: Set<Int>) {
+    if (targets.isEmpty()) return println("WAIT")
+    println(targets.joinToString(";") { "BEACON $it 10" })
+  }
 
-    if (messages.isNotEmpty()) actions.add("MESSAGE ${messages.joinToString(" | ")}")
-    if (actions.isEmpty()) doWait()
-    println(actions.joinToString(";"))
+  private fun readScores() {
+    ownScore = input.nextInt()
+    opponentScore = input.nextInt()
+  }
+
+  private fun readCells() {
+    repeat(numberOfCells) {
+      val cell = getCell(it)
+
+      cell.resources = input.nextInt()
+      cell.ownAnts = input.nextInt()
+      cell.opponentAnts = input.nextInt()
+
+      if (cell.containsEggs()) {
+        currentEggs += cell.resources
+      } else if (cell.containsCrystal()) {
+        currentCrystal += cell.resources
+      }
+    }
   }
 }
